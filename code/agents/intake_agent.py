@@ -1,10 +1,10 @@
 """Intake agent: does request_text authorise deletion?
 
-Deterministic multilingual classifier with an optional LLM hook.
-reported_status is never used as evidence of authorisation.
+Deterministic multilingual classifier (English, Spanish, French, Portuguese,
+German, Japanese, Korean).  reported_status is never used as evidence of
+authorisation: a workflow claim cannot turn a non-deletion request into one.
 """
 from __future__ import annotations
-import os
 import re
 from typing import Tuple
 
@@ -126,24 +126,6 @@ def classify_request(text: str) -> Tuple[bool, str, str]:
     return False, "unknown", "no deletion intent"
 
 
-def optional_llm_intake(text: str) -> Tuple[bool, str, str] | None:
-    """Optional LLM hook (temperature=0). Returns None when no provider is set."""
-    if not os.environ.get("OPENAI_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
-        return None
-    try:
-        from .llm_client import complete_json  # lazy import
-        from pathlib import Path
-        prompt = (Path(__file__).parent / "prompts" / "intake.md").read_text()
-        prompt = prompt.replace("{{request_text}}", text)
-        out = complete_json(prompt)
-        return bool(out.get("authorised")), str(out.get("language", "unknown")), str(out.get("reason", ""))
-    except Exception:
-        return None
-
-
 def authorise(case: Case) -> bool:
-    det = classify_request(case.request_text)
-    llm = optional_llm_intake(case.request_text)
-    if llm is not None:
-        return bool(llm[0])
-    return bool(det[0])
+    """True only when the request text itself asks for deletion."""
+    return bool(classify_request(case.request_text)[0])

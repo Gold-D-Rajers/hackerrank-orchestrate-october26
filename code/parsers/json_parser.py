@@ -146,6 +146,33 @@ def parse_snapshot_bundle(data: Dict, evidence_id: str) -> List[Observation]:
 
 # --- records[] ledgers (connector configs / export manifest / security ledger)
 
+KNOWN_CATEGORIES = {
+    "USER_PROFILE", "SECONDARY_IDENTIFIER", "SEARCH_INDEX_ENTRY", "CACHE_ENTRY",
+    "SUPPORT_MESSAGE", "SUPPORT_ATTACHMENT", "ANALYTICS_PROFILE",
+    "PRODUCT_TELEMETRY", "USER_EXPORT", "MARKETING_PROFILE",
+    "EMAIL_DELIVERY_LOG", "SECURITY_AUDIT_LOG", "LEGAL_HOLD_RECORD",
+    "BACKUP_ARCHIVE", "ACCOUNT_TOMBSTONE", "DATA_FLOW",
+}
+
+CATEGORY_SYSTEM_HINT = {
+    "USER_PROFILE": "account_service",
+    "SECONDARY_IDENTIFIER": "account_service",
+    "SEARCH_INDEX_ENTRY": "search_service",
+    "CACHE_ENTRY": "cache_service",
+    "SUPPORT_MESSAGE": "support_platform",
+    "SUPPORT_ATTACHMENT": "support_platform",
+    "ANALYTICS_PROFILE": "analytics_platform",
+    "PRODUCT_TELEMETRY": "analytics_platform",
+    "USER_EXPORT": "export_service",
+    "MARKETING_PROFILE": "marketing_platform",
+    "EMAIL_DELIVERY_LOG": "email_delivery_service",
+    "SECURITY_AUDIT_LOG": "security_service",
+    "LEGAL_HOLD_RECORD": "legal_service",
+    "BACKUP_ARCHIVE": "backup_service",
+    "ACCOUNT_TOMBSTONE": "identity_service",
+    "DATA_FLOW": "integration_service",
+}
+
 _LEDGER_SYSTEM = {
     "connector_configurations": ("integration_service", "DATA_FLOW"),
     "customer_export_manifest": ("export_service", "USER_EXPORT"),
@@ -160,8 +187,14 @@ def parse_ledger(data: Dict, evidence_id: str, kind: str) -> List[Observation]:
     for rec in data.get("records") or []:
         if not isinstance(rec, dict):
             continue
-        system_id = rec.get("system") or default_system
-        cat = default_cat
+        system_id = (rec.get("system") or default_system or "unknown").lower()
+        # Ledger rows carry their own record_type: a security ledger can list
+        # account profiles, an export manifest can list search documents, etc.
+        # The row's own type always wins over the file's default category.
+        rtype = (rec.get("record_type") or "").upper()
+        cat = rtype if rtype in KNOWN_CATEGORIES else default_cat
+        if rtype in CATEGORY_SYSTEM_HINT and system_id in ("unknown", "", "data_catalog"):
+            system_id = CATEGORY_SYSTEM_HINT[rtype]
         rid = rec.get("resource_id")
         if not rid:
             continue

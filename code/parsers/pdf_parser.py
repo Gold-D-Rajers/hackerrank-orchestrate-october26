@@ -1,6 +1,8 @@
 """PDF evidence parser: deterministic text extraction via pypdf + regex mining."""
 from __future__ import annotations
+import base64
 import re
+import zlib
 from typing import List, Optional
 
 from schemas import Observation
@@ -11,16 +13,111 @@ _RID_RE = re.compile(r"\b((?:account|search|analytics|support|export|data_flow|b
 _PHONE_RE = re.compile(r"\+\d[\d\s()-]{6,}\d")
 
 
+def _decode_streams(data: bytes) -> List[bytes]:
+    """Decode every PDF stream we can (Flate, ASCII85, or both)."""
+    out: List[bytes] = []
+    for m in re.finditer(rb"stream\r?\n", data):
+        start = m.end()
+        end = data.find(b"endstream", start)
+        if end < 0:
+            continue
+        raw = data[start:end].rstrip(b"\r\n")
+        for attempt in ("flate", "a85+flate", "a85"):
+            try:
+                if attempt == "flate":
+                    out.append(zlib.decompress(raw))
+                elif attempt == "a85+flate":
+                    out.append(zlib.decompress(base64.a85decode(raw.rstrip(), adobe=True)))
+                else:
+                    out.append(base64.a85decode(raw.rstrip(), adobe=True))
+                break
+            except Exception:
+                continue
+    return out
+
+
+_STR_RE = re.compile(rb"\((?:\\.|[^\\()])*\)", re.S)
+
+
+def _unescape_pdf_string(s: bytes) -> str:
+    s = s[1:-1]
+    out = []
+    i = 0
+    while i < len(s):
+        c = s[i:i + 1]
+        if c == b"\\" and i + 1 < len(s):
+            nxt = s[i + 1:i + 2]
+            mapping = {b"n": b"\n", b"r": b"\r", b"t": b"\t",
+                       b"(": b"(", b")": b")", b"\\": b"\\"}
+            if nxt in mapping:
+                out.append(mapping[nxt])
+                i += 2
+                continue
+            if nxt.isdigit():  # octal escape
+                oct_digits = re.match(rb"[0-7]{1,3}", s[i + 1:i + 4])
+                if oct_digits:
+                    out.append(bytes([int(oct_digits.group(0), 8) & 0xFF]))
+                    i += 1 + len(oct_digits.group(0))
+                    continue
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return b"".join(out).decode("latin-1")
+
+
+def _extract_text_fallback(path) -> str:
+    """Minimal pure-Python text extraction (no third-party dependencies).
+
+    Handles the shapes used by the supplied artefacts: Flate and/or ASCII85
+    encoded page content streams drawing text with ``(..) Tj`` / ``[..] TJ``.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    lines: List[str] = []
+    for content in _decode_streams(data):
+        if b"BT" not in content or (b"Tj" not in content and b"TJ" not in content):
+            continue
+        for token in re.finditer(
+                rb"\[(?:[^\]\\]|\\.)*\]\s*TJ|\((?:[^()\\]|\\.)*\)\s*Tj|T\*|Td|TD|ET", content):
+            tok = token.group(0)
+            if tok.endswith(b"TJ") or tok.endswith(b"Tj"):
+                parts = [_unescape_pdf_string(s) for s in _STR_RE.findall(tok)]
+                hl = re.findall(rb"<([0-9A-Fa-f\s]+)>", tok)
+                for h in hl:
+                    try:
+                        parts.append(bytes.fromhex(
+                            h.replace(b" ", b"").decode("ascii")).decode("latin-1"))
+                    except ValueError:
+                        pass
+                if parts:
+                    lines.append("".join(parts))
+            elif tok in (b"T*", b"Td", b"TD", b"ET"):
+                lines.append("\n")
+    text = "".join(lines)
+    # collapse the separator flood
+    text = re.sub(r"\n{2,}", "\n", text)
+    return text.strip()
+
+
 def _extract_text(path) -> str:
     try:
         from pypdf import PdfReader
     except ImportError:
-        return ""
-    try:
-        reader = PdfReader(str(path))
-        return "\n".join((pg.extract_text() or "") for pg in reader.pages)
-    except Exception:
-        return ""
+        PdfReader = None  # type: ignore[assignment]
+    if PdfReader is not None:
+        try:
+            reader = PdfReader(str(path))
+            text = "\n".join((pg.extract_text() or "") for pg in reader.pages)
+            if text.strip():
+                return text
+        except Exception:
+            pass
+    return _extract_text_fallback(path)
+
 
 
 def _detect_category(text: str, rids: List[str]) -> tuple:
