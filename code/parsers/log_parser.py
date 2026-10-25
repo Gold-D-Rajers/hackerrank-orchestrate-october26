@@ -76,11 +76,44 @@ def _system_from_service(svc: str) -> Tuple[str, str]:
     return _SERVICE_SYSTEM.get(svc, (svc, "UNKNOWN"))
 
 
+KNOWN_CATEGORIES = {
+    "USER_PROFILE", "SECONDARY_IDENTIFIER", "SEARCH_INDEX_ENTRY", "CACHE_ENTRY",
+    "SUPPORT_MESSAGE", "SUPPORT_ATTACHMENT", "ANALYTICS_PROFILE",
+    "PRODUCT_TELEMETRY", "USER_EXPORT", "MARKETING_PROFILE",
+    "EMAIL_DELIVERY_LOG", "SECURITY_AUDIT_LOG", "LEGAL_HOLD_RECORD",
+    "BACKUP_ARCHIVE", "ACCOUNT_TOMBSTONE", "DATA_FLOW",
+}
+
+# ``result`` values used by the readback / diagnostic exports to describe the
+# state of the *record* they looked up.
+_RECORD_STATE = {
+    "FOUND": "PRESENT", "PRESENT": "PRESENT", "HIT": "PRESENT",
+    "ACTIVE": "PRESENT", "IDENTIFIABLE": "EXPOSED", "EXPOSED": "EXPOSED",
+    "ANONYMIZED": "ANONYMIZED", "DEIDENTIFIED": "ANONYMIZED",
+    "REDACTED": "REDACTED",
+    "NOT_FOUND": "ABSENT", "ABSENT": "ABSENT", "MISS": "ABSENT",
+    "DELETED": "ABSENT",
+    "DISABLED": "DISABLED", "STOPPED": "DISABLED",
+    "BLOCKED": "BLOCKED", "RESTORE_BLOCKED": "BLOCKED",
+    "ENABLED": "ENABLED", "DELIVERING": "ENABLED",
+}
+
+
 def _obs_from_kv(kv: Dict, ts: str, evidence_id: str,
                  forced_rid: Optional[str] = None) -> Optional[Observation]:
     svc = kv.get("service") or kv.get("logger") or kv.get("function") or ""
     system_id, category = _system_from_service(str(svc))
     rid = forced_rid or kv.get("resource_id")
+
+    # A diagnostic / readback export names the *record* it inspected inside the
+    # line (system=..., record_type=...).  That always beats the log's own
+    # service name, which only says which tool performed the lookup.
+    rec_system = str(kv.get("system") or "").lower()
+    rec_type = str(kv.get("record_type") or "").upper()
+    record_lookup = bool(rid and rec_type in KNOWN_CATEGORIES and rec_system
+                         and rec_system not in ("unknown", ""))
+    if record_lookup:
+        system_id, category = rec_system, rec_type
     if not rid:
         return None
     if system_id not in _SERVICE_SYSTEM:
@@ -121,6 +154,42 @@ def _obs_from_kv(kv: Dict, ts: str, evidence_id: str,
     if uref and not _is_null(uref):
         obs.user_ref = str(uref)
         obs.link_tokens.add(str(uref))
+
+    if record_lookup:
+        state = _RECORD_STATE.get(str(kv.get("result") or "").upper(), "")
+        if state == "ABSENT":
+            obs.exists = False
+            obs.pii_exposed = False
+            obs.anonymized = False
+            obs.redacted = False
+        elif state == "EXPOSED":
+            obs.exists = True
+            obs.pii_exposed = True
+            obs.redacted = False
+            obs.anonymized = False
+        elif state == "ANONYMIZED":
+            obs.exists = True
+            obs.pii_exposed = False
+            obs.anonymized = True
+        elif state == "REDACTED":
+            obs.exists = True
+            obs.pii_exposed = False
+            obs.redacted = True
+        elif state == "PRESENT":
+            obs.exists = True
+            obs.pii_exposed = bool(obs.email or obs.phone or obs.email_hash)
+        if category == "DATA_FLOW":
+            obs.exists = True
+            obs.enabled = {"DISABLED": False, "ENABLED": True}.get(state)
+            if obs.enabled is None:
+                obs.enabled = state != "ABSENT"
+        elif category == "BACKUP_ARCHIVE":
+            obs.archive_present = state != "ABSENT"
+            if state == "BLOCKED":
+                obs.restore_allowed = False
+            elif state != "ABSENT":
+                obs.restore_allowed = True
+        return obs
 
     # --- state interpretation
     rows = kv.get("rows")

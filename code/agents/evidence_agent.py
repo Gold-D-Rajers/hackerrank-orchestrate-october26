@@ -39,6 +39,8 @@ class EvidenceIndex:
         # (system, resource) -> last workflow treatment ("DELETE"/"ANONYMIZE"/
         # "REDACT") as submitted in system_activity record events
         self.workflow_action: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        # resource_id -> [activity rows] (the operational history of a record)
+        self.activities: Dict[str, List[Dict]] = {}
         self.build()
 
     # ------------------------------------------------------------------ build
@@ -102,6 +104,12 @@ class EvidenceIndex:
                 sys_t = row["target_system"] or row["source_system"]
                 aid = row["activity_id"]
                 details = row.get("details") or ""
+                self.activities.setdefault(rid, []).append({
+                    "activity_id": aid,
+                    "event_time": ts,
+                    "event_type": et,
+                    "reported_result": row.get("reported_result") or "",
+                })
 
                 if et in ("DELETE_RECORD", "ANONYMIZE_RECORD", "REDACT_RECORD"):
                     act = et.split("_", 1)[0]
@@ -156,6 +164,14 @@ class EvidenceIndex:
                     )
                     self.activity_flow_status.append(obs)
                     self.observations.append(obs)
+
+    # ------------------------------------------------------------- citations
+    def activities_for(self, resource_id: str, audit_ts: str) -> List[Dict]:
+        """Activity rows for one record at/before the audit instant."""
+        rows = [a for a in self.activities.get(resource_id, ())
+                if a["event_time"] and a["event_time"] <= audit_ts]
+        rows.sort(key=lambda a: (a["event_time"], a["activity_id"]))
+        return rows
 
     # ------------------------------------------------------------- subject link
     def resources_for_tokens(self, tokens: Set[str], audit_ts: str) -> Set[Tuple[str, str]]:
